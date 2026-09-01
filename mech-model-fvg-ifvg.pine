@@ -263,8 +263,11 @@ if bearSignal and firstSignalOnly
 // ============================================================================
 // PLOTS & ALERTS
 // ============================================================================
-plotshape(bullSignal, title="Buy Signal", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.small)
-plotshape(bearSignal, title="Sell Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.small)
+if bullSignal
+    label.new(bar_index, low, "BUY", style=label.style_label_up, color=color.new(color.green, 0), textcolor=color.white, size=size.small)
+
+if bearSignal
+    label.new(bar_index, high, "SELL", style=label.style_label_down, color=color.new(color.red, 0), textcolor=color.white, size=size.small)
 
 alertcondition(bullSignal, title="Mech Model Buy", message="Mech Model BUY: swing break + HTF FVG key area + LTF iFVG close-through confirmed")
 alertcondition(bearSignal, title="Mech Model Sell", message="Mech Model SELL: swing break + HTF FVG key area + LTF iFVG close-through confirmed")
