@@ -1,0 +1,320 @@
+//@version=5
+// ============================================================================
+// Mech Model: Swing Break + HTF FVG (key area) + LTF Inverse FVG confirmation
+//
+// Logic:
+//  1. Track swing highs/lows (pivots).
+//  2. When price breaks a swing high/low, check whether that swing's price
+//     level sits inside an unmitigated HTF Fair Value Gap (15m+ default).
+//     If so, "arm" a bullish/bearish setup with that FVG as the key area.
+//  3. While armed, watch the LTF (30s+ / chart timeframe) for a Fair Value
+//     Gap to form and then invert (price fully closes through it). The
+//     candle that closes through must also close back inside the HTF key
+//     area. That confirmed close is the Buy/Sell trigger.
+//  4. A setup disarms after firing, after a bar timeout, or (optionally) if
+//     price closes back past the broken swing (structure failure).
+//
+// Built for use on TradingView charts, including FX Replay (which renders
+// on TradingView's charting library), so replay bars trigger it the same
+// way live bars would.
+// ============================================================================
+indicator("Mech Model - Swing Break + HTF FVG + LTF iFVG [FX Replay]", shorttitle="MechModel-FXR", overlay=true, max_boxes_count=500, max_lines_count=500, max_labels_count=500)
+
+// ============================================================================
+// INPUTS
+// ============================================================================
+gSwing = "Swing Structure"
+swingLen          = input.int(5, "Swing Lookback (bars each side)", minval=1, group=gSwing)
+requireCloseBreak = input.bool(true, "Require Close Beyond Swing (vs. Wick)", group=gSwing)
+
+gHtf = "HTF Fair Value Gap (Key Area)"
+htfTF           = input.timeframe("15", "HTF Timeframe (15m minimum)", group=gHtf)
+maxHtfFvg       = input.int(30, "Max HTF FVGs Tracked", minval=5, maxval=100, group=gHtf)
+htfMitigateMode = input.string("Full Close Through", "HTF FVG Mitigation", options=["Full Close Through", "Any Touch"], group=gHtf)
+
+gLtf = "LTF Inverse FVG (Entry Trigger)"
+useChartTFforLTF = input.bool(true, "Use Current Chart Timeframe for iFVG", group=gLtf)
+customLtfTF      = input.timeframe("30S", "Custom LTF (used only if above is off)", group=gLtf)
+maxLtfFvg        = input.int(20, "Max LTF FVGs Tracked", minval=5, maxval=60, group=gLtf)
+
+gArm = "Setup Logic"
+maxArmedBars     = input.int(150, "Max Bars to Wait for iFVG After Break", minval=5, group=gArm)
+firstSignalOnly  = input.bool(true, "Only First Qualifying iFVG per Setup", group=gArm)
+invalidateOnFail = input.bool(true, "Disarm if Price Closes Back Past Broken Swing", group=gArm)
+
+gDisp = "Display"
+showHtfBoxes   = input.bool(true, "Show HTF FVG Zones", group=gDisp)
+showLtfBoxes   = input.bool(false, "Show LTF FVG Zones", group=gDisp)
+showSwingMarks = input.bool(true, "Show Swing High/Low Markers", group=gDisp)
+bullFvgColor   = input.color(color.new(color.teal, 75), "Bullish FVG Color", group=gDisp)
+bearFvgColor   = input.color(color.new(color.red, 75), "Bearish FVG Color", group=gDisp)
+mitigatedColor = input.color(color.new(color.gray, 90), "Mitigated FVG Color", group=gDisp)
+
+// ============================================================================
+// TIMEFRAME VALIDATION (warns instead of hard-blocking, since Pine can't
+// restrict input.timeframe() choices directly)
+// ============================================================================
+htfTooSmall = timeframe.in_seconds(htfTF) < 900
+ltfTooSmall = not useChartTFforLTF and timeframe.in_seconds(customLtfTF) < 30
+
+var label warnLbl = na
+if barstate.islast
+    warnTxt = (htfTooSmall ? "HTF must be >= 15m. " : "") + (ltfTooSmall ? "Custom LTF must be >= 30s." : "")
+    if warnTxt != ""
+        if na(warnLbl)
+            warnLbl := label.new(bar_index, high, warnTxt, style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, xloc=xloc.bar_index)
+        else
+            label.set_xy(warnLbl, bar_index, high)
+            label.set_text(warnLbl, warnTxt)
+
+// ============================================================================
+// SWING HIGH / LOW DETECTION
+// ============================================================================
+swHigh = ta.pivothigh(high, swingLen, swingLen)
+swLow  = ta.pivotlow(low, swingLen, swingLen)
+
+var float lastSwingHigh  = na
+var bool  swingHighUsed  = true
+
+var float lastSwingLow   = na
+var bool  swingLowUsed   = true
+
+if not na(swHigh)
+    lastSwingHigh := swHigh
+    swingHighUsed := false
+    if showSwingMarks
+        label.new(bar_index - swingLen, swHigh, "H", style=label.style_label_down, color=color.new(color.white, 100), textcolor=color.new(color.silver, 20), size=size.tiny)
+
+if not na(swLow)
+    lastSwingLow := swLow
+    swingLowUsed := false
+    if showSwingMarks
+        label.new(bar_index - swingLen, swLow, "L", style=label.style_label_up, color=color.new(color.white, 100), textcolor=color.new(color.silver, 20), size=size.tiny)
+
+// ============================================================================
+// HTF FAIR VALUE GAP DETECTION (non-repainting: only references already
+// closed HTF bars via [1]/[2]/[3] offsets)
+// ============================================================================
+[c_h, c_l, b_h, b_l, a_h, a_l, htfBarTime] = request.security(syminfo.tickerid, htfTF,
+     [high[1], low[1], high[2], low[2], high[3], low[3], time[1]], lookahead=barmerge.lookahead_off)
+
+var float lastHtfBarTime = na
+newHtfBar = htfBarTime != lastHtfBarTime and not na(htfBarTime)
+
+var array<float> htfTop   = array.new_float()
+var array<float> htfBot   = array.new_float()
+var array<bool>  htfBull  = array.new_bool()
+var array<bool>  htfLive  = array.new_bool()
+var array<box>   htfBoxes = array.new_box()
+
+if newHtfBar
+    lastHtfBarTime := htfBarTime
+    bullGap = a_h < c_l
+    bearGap = a_l > c_h
+    if bullGap or bearGap
+        top = bullGap ? c_l : a_l
+        bot = bullGap ? a_h : c_h
+        array.unshift(htfTop, top)
+        array.unshift(htfBot, bot)
+        array.unshift(htfBull, bullGap)
+        array.unshift(htfLive, true)
+        newBox = showHtfBoxes ? box.new(bar_index - 2, top, bar_index + 200, bot, border_color=bullGap ? color.teal : color.red, bgcolor=bullGap ? bullFvgColor : bearFvgColor, extend=extend.none) : na
+        array.unshift(htfBoxes, newBox)
+        if array.size(htfTop) > maxHtfFvg
+            array.pop(htfTop)
+            array.pop(htfBot)
+            array.pop(htfBull)
+            array.pop(htfLive)
+            oldBox = array.pop(htfBoxes)
+            if not na(oldBox)
+                box.delete(oldBox)
+
+if array.size(htfTop) > 0
+    for i = 0 to array.size(htfTop) - 1
+        if array.get(htfLive, i)
+            zt = array.get(htfTop, i)
+            zb = array.get(htfBot, i)
+            zbull = array.get(htfBull, i)
+            mitigated = htfMitigateMode == "Full Close Through" ? (zbull ? close < zb : close > zt) : (zbull ? low <= zb : high >= zt)
+            zbox = array.get(htfBoxes, i)
+            if mitigated
+                array.set(htfLive, i, false)
+                if not na(zbox)
+                    box.set_right(zbox, bar_index)
+                    box.set_bgcolor(zbox, mitigatedColor)
+                    box.set_border_color(zbox, color.new(color.gray, 50))
+            else
+                if not na(zbox)
+                    box.set_right(zbox, bar_index + 5)
+
+// Returns index of first live HTF FVG whose range contains "level", else -1
+findHtfZoneForLevel(level) =>
+    idx = -1
+    if array.size(htfTop) > 0
+        for i = 0 to array.size(htfTop) - 1
+            if idx == -1 and array.get(htfLive, i)
+                t = array.get(htfTop, i)
+                b = array.get(htfBot, i)
+                if level <= t and level >= b
+                    idx := i
+    idx
+
+// ============================================================================
+// SWING BREAK -> ARM SETUP IF THE SWING LEVEL IS INSIDE AN HTF FVG
+// ============================================================================
+var bool  armedBull        = false
+var float armedTop         = na
+var float armedBot         = na
+var int   armedBar         = na
+var float armedSwingLevel  = na
+
+var bool  armedBear        = false
+var float armedTopB        = na
+var float armedBotB        = na
+var int   armedBarB        = na
+var float armedSwingLevelB = na
+
+bullBreak = requireCloseBreak ? (not na(lastSwingHigh) and not swingHighUsed and close > lastSwingHigh) : (not na(lastSwingHigh) and not swingHighUsed and high > lastSwingHigh)
+bearBreak = requireCloseBreak ? (not na(lastSwingLow) and not swingLowUsed and close < lastSwingLow) : (not na(lastSwingLow) and not swingLowUsed and low < lastSwingLow)
+
+if bullBreak
+    swingHighUsed := true
+    zoneIdx = findHtfZoneForLevel(lastSwingHigh)
+    if zoneIdx != -1
+        armedBull       := true
+        armedTop        := array.get(htfTop, zoneIdx)
+        armedBot        := array.get(htfBot, zoneIdx)
+        armedBar        := bar_index
+        armedSwingLevel := lastSwingHigh
+
+if bearBreak
+    swingLowUsed := true
+    zoneIdxB = findHtfZoneForLevel(lastSwingLow)
+    if zoneIdxB != -1
+        armedBear        := true
+        armedTopB        := array.get(htfTop, zoneIdxB)
+        armedBotB        := array.get(htfBot, zoneIdxB)
+        armedBarB        := bar_index
+        armedSwingLevelB := lastSwingLow
+
+if armedBull and (bar_index - armedBar > maxArmedBars or (invalidateOnFail and close < armedSwingLevel))
+    armedBull := false
+
+if armedBear and (bar_index - armedBarB > maxArmedBars or (invalidateOnFail and close > armedSwingLevelB))
+    armedBear := false
+
+// ============================================================================
+// LTF FAIR VALUE GAP + INVERSION (iFVG) DETECTION -> BUY/SELL TRIGGER
+// ============================================================================
+var array<float> ltfTop   = array.new_float()
+var array<float> ltfBot   = array.new_float()
+var array<bool>  ltfBull  = array.new_bool()
+var array<bool>  ltfLive  = array.new_bool()
+var array<box>   ltfBoxes = array.new_box()
+
+bool bullSignal = false
+bool bearSignal = false
+
+if useChartTFforLTF
+    if barstate.isconfirmed
+        bullGapL = low > high[2]
+        bearGapL = high < low[2]
+        if bullGapL or bearGapL
+            topL = bullGapL ? low : low[2]
+            botL = bullGapL ? high[2] : high
+            array.unshift(ltfTop, topL)
+            array.unshift(ltfBot, botL)
+            array.unshift(ltfBull, bullGapL)
+            array.unshift(ltfLive, true)
+            boxL = showLtfBoxes ? box.new(bar_index - 2, topL, bar_index + 20, botL, border_color=bullGapL ? color.aqua : color.orange, bgcolor=color.new(bullGapL ? color.aqua : color.orange, 85), extend=extend.none) : na
+            array.unshift(ltfBoxes, boxL)
+            if array.size(ltfTop) > maxLtfFvg
+                array.pop(ltfTop)
+                array.pop(ltfBot)
+                array.pop(ltfBull)
+                array.pop(ltfLive)
+                obx = array.pop(ltfBoxes)
+                if not na(obx)
+                    box.delete(obx)
+
+        if array.size(ltfTop) > 0
+            for i = 0 to array.size(ltfTop) - 1
+                if array.get(ltfLive, i)
+                    lt = array.get(ltfTop, i)
+                    lb = array.get(ltfBot, i)
+                    lbull = array.get(ltfBull, i)
+                    lbox = array.get(ltfBoxes, i)
+                    if lbull and close < lb
+                        array.set(ltfLive, i, false)
+                        if not na(lbox)
+                            box.set_right(lbox, bar_index)
+                        if armedBear and close <= armedTopB and close >= armedBotB
+                            bearSignal := true
+                    else if (not lbull) and close > lt
+                        array.set(ltfLive, i, false)
+                        if not na(lbox)
+                            box.set_right(lbox, bar_index)
+                        if armedBull and close <= armedTop and close >= armedBot
+                            bullSignal := true
+else
+    [lc_h, lc_l, lc_c, lb_h, lb_l, la_h, la_l, ltfBarTime] = request.security(syminfo.tickerid, customLtfTF,
+         [high[1], low[1], close[1], high[2], low[2], high[3], low[3], time[1]], lookahead=barmerge.lookahead_off)
+
+    var float lastLtfBarTime = na
+    newLtfBar = ltfBarTime != lastLtfBarTime and not na(ltfBarTime)
+
+    if newLtfBar
+        lastLtfBarTime := ltfBarTime
+        bullGapL2 = la_h < lc_l
+        bearGapL2 = la_l > lc_h
+        if bullGapL2 or bearGapL2
+            topL2 = bullGapL2 ? lc_l : la_l
+            botL2 = bullGapL2 ? la_h : lc_h
+            array.unshift(ltfTop, topL2)
+            array.unshift(ltfBot, botL2)
+            array.unshift(ltfBull, bullGapL2)
+            array.unshift(ltfLive, true)
+            boxL2 = showLtfBoxes ? box.new(bar_index - 2, topL2, bar_index + 20, botL2, border_color=bullGapL2 ? color.aqua : color.orange, bgcolor=color.new(bullGapL2 ? color.aqua : color.orange, 85), extend=extend.none) : na
+            array.unshift(ltfBoxes, boxL2)
+            if array.size(ltfTop) > maxLtfFvg
+                array.pop(ltfTop)
+                array.pop(ltfBot)
+                array.pop(ltfBull)
+                array.pop(ltfLive)
+                obx2 = array.pop(ltfBoxes)
+                if not na(obx2)
+                    box.delete(obx2)
+
+        if array.size(ltfTop) > 0
+            for i = 0 to array.size(ltfTop) - 1
+                if array.get(ltfLive, i)
+                    lt2 = array.get(ltfTop, i)
+                    lb2 = array.get(ltfBot, i)
+                    lbull2 = array.get(ltfBull, i)
+                    lbox2 = array.get(ltfBoxes, i)
+                    if lbull2 and lc_c < lb2
+                        array.set(ltfLive, i, false)
+                        if not na(lbox2)
+                            box.set_right(lbox2, bar_index)
+                        if armedBear and lc_c <= armedTopB and lc_c >= armedBotB
+                            bearSignal := true
+                    else if (not lbull2) and lc_c > lt2
+                        array.set(ltfLive, i, false)
+                        if not na(lbox2)
+                            box.set_right(lbox2, bar_index)
+                        if armedBull and lc_c <= armedTop and lc_c >= armedBot
+                            bullSignal := true
+
+if bullSignal and firstSignalOnly
+    armedBull := false
+if bearSignal and firstSignalOnly
+    armedBear := false
+
+// ============================================================================
+// PLOTS & ALERTS
+// ============================================================================
+plotshape(bullSignal, title="Buy Signal", style=shape.labelup, location=location.belowbar, color=color.new(color.green, 0), text="BUY", textcolor=color.white, size=size.small)
+plotshape(bearSignal, title="Sell Signal", style=shape.labeldown, location=location.abovebar, color=color.new(color.red, 0), text="SELL", textcolor=color.white, size=size.small)
+
+alertcondition(bullSignal, title="Mech Model Buy", message="Mech Model BUY: swing break + HTF FVG key area + LTF iFVG close-through confirmed")
+alertcondition(bearSignal, title="Mech Model Sell", message="Mech Model SELL: swing break + HTF FVG key area + LTF iFVG close-through confirmed")
