@@ -33,9 +33,9 @@ maxHtfFvg       = input.int(30, "Max HTF FVGs Tracked", minval=5, maxval=100, gr
 htfMitigateMode = input.string("Full Close Through", "HTF FVG Mitigation", options=["Full Close Through", "Any Touch"], group=gHtf)
 
 gLtf = "LTF Inverse FVG (Entry Trigger)"
-useChartTFforLTF = input.bool(true, "Use Current Chart Timeframe for iFVG", group=gLtf)
-customLtfTF      = input.timeframe("30S", "Custom LTF (used only if above is off)", group=gLtf)
-maxLtfFvg        = input.int(20, "Max LTF FVGs Tracked", minval=5, maxval=60, group=gLtf)
+// iFVG detection always runs on the chart's own timeframe — set your chart
+// to your desired LTF (30s or higher) to control it.
+maxLtfFvg = input.int(20, "Max LTF FVGs Tracked", minval=5, maxval=60, group=gLtf)
 
 gArm = "Setup Logic"
 maxArmedBars     = input.int(150, "Max Bars to Wait for iFVG After Break", minval=5, group=gArm)
@@ -55,11 +55,11 @@ mitigatedColor = input.color(color.new(color.gray, 90), "Mitigated FVG Color", g
 // restrict input.timeframe() choices directly)
 // ============================================================================
 htfTooSmall = timeframe.in_seconds(htfTF) < 900
-ltfTooSmall = not useChartTFforLTF and timeframe.in_seconds(customLtfTF) < 30
+chartTooSmall = timeframe.in_seconds(timeframe.period) < 30
 
 var label warnLbl = na
 if barstate.islast
-    warnTxt = (htfTooSmall ? "HTF must be >= 15m. " : "") + (ltfTooSmall ? "Custom LTF must be >= 30s." : "")
+    warnTxt = (htfTooSmall ? "HTF must be >= 15m. " : "") + (chartTooSmall ? "Chart timeframe should be >= 30s for iFVG detection." : "")
     if warnTxt != ""
         if na(warnLbl)
             warnLbl := label.new(bar_index, high, warnTxt, style=label.style_label_down, color=color.new(color.orange, 0), textcolor=color.white, xloc=xloc.bar_index)
@@ -95,8 +95,7 @@ if not na(swLow)
 // HTF FAIR VALUE GAP DETECTION (non-repainting: only references already
 // closed HTF bars via [1]/[2]/[3] offsets)
 // ============================================================================
-[c_h, c_l, b_h, b_l, a_h, a_l, htfBarTime] = request.security(syminfo.tickerid, htfTF,
-     [high[1], low[1], high[2], low[2], high[3], low[3], time[1]], lookahead=barmerge.lookahead_off)
+[c_h, c_l, b_h, b_l, a_h, a_l, htfBarTime] = request.security(syminfo.tickerid, htfTF, [high[1], low[1], high[2], low[2], high[3], low[3], time[1]], lookahead=barmerge.lookahead_off)
 
 var float lastHtfBarTime = na
 newHtfBar = htfBarTime != lastHtfBarTime and not na(htfBarTime)
@@ -215,95 +214,46 @@ var array<box>   ltfBoxes = array.new_box()
 bool bullSignal = false
 bool bearSignal = false
 
-if useChartTFforLTF
-    if barstate.isconfirmed
-        bullGapL = low > high[2]
-        bearGapL = high < low[2]
-        if bullGapL or bearGapL
-            topL = bullGapL ? low : low[2]
-            botL = bullGapL ? high[2] : high
-            array.unshift(ltfTop, topL)
-            array.unshift(ltfBot, botL)
-            array.unshift(ltfBull, bullGapL)
-            array.unshift(ltfLive, true)
-            boxL = showLtfBoxes ? box.new(bar_index - 2, topL, bar_index + 20, botL, border_color=bullGapL ? color.aqua : color.orange, bgcolor=color.new(bullGapL ? color.aqua : color.orange, 85), extend=extend.none) : na
-            array.unshift(ltfBoxes, boxL)
-            if array.size(ltfTop) > maxLtfFvg
-                array.pop(ltfTop)
-                array.pop(ltfBot)
-                array.pop(ltfBull)
-                array.pop(ltfLive)
-                obx = array.pop(ltfBoxes)
-                if not na(obx)
-                    box.delete(obx)
+if barstate.isconfirmed
+    bullGapL = low > high[2]
+    bearGapL = high < low[2]
+    if bullGapL or bearGapL
+        topL = bullGapL ? low : low[2]
+        botL = bullGapL ? high[2] : high
+        array.unshift(ltfTop, topL)
+        array.unshift(ltfBot, botL)
+        array.unshift(ltfBull, bullGapL)
+        array.unshift(ltfLive, true)
+        boxL = showLtfBoxes ? box.new(bar_index - 2, topL, bar_index + 20, botL, border_color=bullGapL ? color.aqua : color.orange, bgcolor=color.new(bullGapL ? color.aqua : color.orange, 85), extend=extend.none) : na
+        array.unshift(ltfBoxes, boxL)
+        if array.size(ltfTop) > maxLtfFvg
+            array.pop(ltfTop)
+            array.pop(ltfBot)
+            array.pop(ltfBull)
+            array.pop(ltfLive)
+            obx = array.pop(ltfBoxes)
+            if not na(obx)
+                box.delete(obx)
 
-        if array.size(ltfTop) > 0
-            for i = 0 to array.size(ltfTop) - 1
-                if array.get(ltfLive, i)
-                    lt = array.get(ltfTop, i)
-                    lb = array.get(ltfBot, i)
-                    lbull = array.get(ltfBull, i)
-                    lbox = array.get(ltfBoxes, i)
-                    if lbull and close < lb
-                        array.set(ltfLive, i, false)
-                        if not na(lbox)
-                            box.set_right(lbox, bar_index)
-                        if armedBear and close <= armedTopB and close >= armedBotB
-                            bearSignal := true
-                    else if (not lbull) and close > lt
-                        array.set(ltfLive, i, false)
-                        if not na(lbox)
-                            box.set_right(lbox, bar_index)
-                        if armedBull and close <= armedTop and close >= armedBot
-                            bullSignal := true
-else
-    [lc_h, lc_l, lc_c, lb_h, lb_l, la_h, la_l, ltfBarTime] = request.security(syminfo.tickerid, customLtfTF,
-         [high[1], low[1], close[1], high[2], low[2], high[3], low[3], time[1]], lookahead=barmerge.lookahead_off)
-
-    var float lastLtfBarTime = na
-    newLtfBar = ltfBarTime != lastLtfBarTime and not na(ltfBarTime)
-
-    if newLtfBar
-        lastLtfBarTime := ltfBarTime
-        bullGapL2 = la_h < lc_l
-        bearGapL2 = la_l > lc_h
-        if bullGapL2 or bearGapL2
-            topL2 = bullGapL2 ? lc_l : la_l
-            botL2 = bullGapL2 ? la_h : lc_h
-            array.unshift(ltfTop, topL2)
-            array.unshift(ltfBot, botL2)
-            array.unshift(ltfBull, bullGapL2)
-            array.unshift(ltfLive, true)
-            boxL2 = showLtfBoxes ? box.new(bar_index - 2, topL2, bar_index + 20, botL2, border_color=bullGapL2 ? color.aqua : color.orange, bgcolor=color.new(bullGapL2 ? color.aqua : color.orange, 85), extend=extend.none) : na
-            array.unshift(ltfBoxes, boxL2)
-            if array.size(ltfTop) > maxLtfFvg
-                array.pop(ltfTop)
-                array.pop(ltfBot)
-                array.pop(ltfBull)
-                array.pop(ltfLive)
-                obx2 = array.pop(ltfBoxes)
-                if not na(obx2)
-                    box.delete(obx2)
-
-        if array.size(ltfTop) > 0
-            for i = 0 to array.size(ltfTop) - 1
-                if array.get(ltfLive, i)
-                    lt2 = array.get(ltfTop, i)
-                    lb2 = array.get(ltfBot, i)
-                    lbull2 = array.get(ltfBull, i)
-                    lbox2 = array.get(ltfBoxes, i)
-                    if lbull2 and lc_c < lb2
-                        array.set(ltfLive, i, false)
-                        if not na(lbox2)
-                            box.set_right(lbox2, bar_index)
-                        if armedBear and lc_c <= armedTopB and lc_c >= armedBotB
-                            bearSignal := true
-                    else if (not lbull2) and lc_c > lt2
-                        array.set(ltfLive, i, false)
-                        if not na(lbox2)
-                            box.set_right(lbox2, bar_index)
-                        if armedBull and lc_c <= armedTop and lc_c >= armedBot
-                            bullSignal := true
+    if array.size(ltfTop) > 0
+        for i = 0 to array.size(ltfTop) - 1
+            if array.get(ltfLive, i)
+                lt = array.get(ltfTop, i)
+                lb = array.get(ltfBot, i)
+                lbull = array.get(ltfBull, i)
+                lbox = array.get(ltfBoxes, i)
+                if lbull and close < lb
+                    array.set(ltfLive, i, false)
+                    if not na(lbox)
+                        box.set_right(lbox, bar_index)
+                    if armedBear and close <= armedTopB and close >= armedBotB
+                        bearSignal := true
+                else if (not lbull) and close > lt
+                    array.set(ltfLive, i, false)
+                    if not na(lbox)
+                        box.set_right(lbox, bar_index)
+                    if armedBull and close <= armedTop and close >= armedBot
+                        bullSignal := true
 
 if bullSignal and firstSignalOnly
     armedBull := false

@@ -15,11 +15,11 @@ library — the indicator triggers on replay bars exactly as it would live.
 3. **Key area filter** — the break only "arms" a setup if the broken swing's
    *price level* sits inside an unmitigated Fair Value Gap on the HTF
    (15m minimum, default 15m).
-4. **Entry trigger** — while armed, the script watches the LTF (30s minimum;
-   defaults to your chart's own timeframe) for a Fair Value Gap to form and
-   then fully invert — i.e., a candle **closes** completely through it. That
-   inversion candle's close must also land back inside the HTF key area.
-   When it closes, a `BUY`/`SELL` label prints on that bar.
+4. **Entry trigger** — while armed, the script watches the chart's own
+   timeframe (view your chart at 30s or higher) for a Fair Value Gap to
+   form and then fully invert — i.e., a candle **closes** completely through
+   it. That inversion candle's close must also land back inside the HTF key
+   area. When it closes, a `BUY`/`SELL` label prints on that bar.
 5. A setup disarms after it fires, after a bar timeout, or (optional) if
    price closes back past the swing that triggered it (failed structure).
 
@@ -29,9 +29,9 @@ library — the indicator triggers on replay bars exactly as it would live.
    Editor**.
 2. Paste the contents of `mech-model-fvg-ifvg.pine`.
 3. **Add to Chart**.
-4. Recommended starting setup: view chart at your intended LTF (e.g. 1m or
-   lower on FX Replay), leave `Use Current Chart Timeframe for iFVG` on, and
-   set `HTF Timeframe` to 15m or higher.
+4. Recommended starting setup: view your chart at the LTF you want iFVG
+   confirmation on (e.g. 30s–1m on FX Replay) and set `HTF Timeframe` to
+   15m or higher.
 
 ## Key inputs
 
@@ -39,9 +39,8 @@ library — the indicator triggers on replay bars exactly as it would live.
 - `HTF Timeframe` — the higher timeframe FVGs are pulled from (15m+).
 - `HTF FVG Mitigation` — whether a zone is invalidated on any touch or only
   a full close-through.
-- `Use Current Chart Timeframe for iFVG` — off lets you specify a custom LTF
-  (e.g. `30S`) independent of your chart's timeframe (requires a data plan
-  with sub-minute resolution).
+- iFVG confirmation always runs on your chart's own timeframe — switch the
+  chart itself to change it (e.g. 30s, 1m).
 - `Max Bars to Wait for iFVG After Break` — setup timeout.
 - `Only First Qualifying iFVG per Setup` — fire once per armed setup vs.
   every qualifying inversion.
@@ -59,7 +58,8 @@ TradingView alerts without polling the chart.
   that same zone). Tune the inputs against your own chart review — swing
   lookback and mitigation mode in particular will change signal frequency
   a lot.
-- All HTF/LTF FVG detection uses only fully closed bars (via `[1]`/`[2]`/`[3]`
-  offsets and `barmerge.lookahead_off`), so it does not repaint.
-- Sub-minute custom LTF timeframes require a TradingView plan with
-  intrabar/seconds resolution.
+- HTF FVG detection uses only fully closed bars (via `[1]`/`[2]`/`[3]`
+  offsets and `barmerge.lookahead_off`), so it does not repaint. LTF iFVG
+  detection fires only on `barstate.isconfirmed` (closed chart bars).
+- Sub-30-second chart resolutions require a TradingView plan with
+  intrabar/seconds data.
